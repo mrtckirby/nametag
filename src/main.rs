@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"] // Prevents console window
+#![windows_subsystem = "windows"]
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
@@ -10,7 +10,6 @@ use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetCapture;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-// App state structure tied cleanly to the window instance
 struct AppState {
     display_name: Vec<u16>,
     dark_mode: bool,
@@ -43,10 +42,10 @@ fn main() {
 
         RegisterClassW(&wnd_class);
 
-        // Measure text width
+        // Calculate text geometry
         let hdc = CreateDCW(w!("DISPLAY"), std::ptr::null(), std::ptr::null(), std::ptr::null());
         let font = CreateFontW(
-            -15, 0, 0, 0, FW_BOLD as i32, 0, 0, 0,
+            -14, 0, 0, 0, FW_BOLD as i32, 0, 0, 0,
             DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32,
             CLIP_DEFAULT_PRECIS as u32, DEFAULT_QUALITY as u32,
             (DEFAULT_PITCH | FF_DONTCARE) as u32, w!("Segoe UI")
@@ -59,7 +58,7 @@ fn main() {
         SelectObject(hdc, old_font);
         DeleteDC(hdc);
 
-        let padding_x = 24;
+        let padding_x = 20;
         let padding_y = 6;
         let window_width = text_size.cx + padding_x;
         let window_height = text_size.cy + padding_y;
@@ -67,7 +66,6 @@ fn main() {
         let screen_width = GetSystemMetrics(SM_CXSCREEN);
         let initial_x = (screen_width / 2) - (window_width / 2);
 
-        // Package application state
         let state = Box::new(AppState {
             display_name,
             dark_mode,
@@ -87,11 +85,11 @@ fn main() {
             state_ptr as *const _ as *const std::ffi::c_void,
         );
 
-        // Apply rounded bottom corners
-        let rgn = CreateRoundRectRgn(0, -12, window_width + 1, window_height + 1, 12, 12);
+        // Apply a smooth region mask: -12 top offset flushes the top edge while rounding bottom corners
+        let corner_radius = 12;
+        let rgn = CreateRoundRectRgn(0, -corner_radius, window_width + 1, window_height + 1, corner_radius, corner_radius);
         SetWindowRgn(hwnd, rgn, 1);
 
-        // Message Loop
         let mut msg = MSG {
             hwnd: 0 as _,
             message: 0,
@@ -142,28 +140,39 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
             GetClientRect(hwnd, &mut rect);
 
-            // 1. Draw Border Frame
-            let border_brush = CreateSolidBrush(border_color);
-            FillRect(hdc, &rect, border_brush);
-            DeleteObject(border_brush as _);
-
-            // 2. Background Fill
-            let inner_rect = RECT {
-                left: 1,
-                top: 1,
-                right: rect.right - 1,
-                bottom: rect.bottom - 1,
-            };
+            // Create Pen (1px border) and Brush (background fill)
+            let border_pen = CreatePen(PS_SOLID as i32, 1, border_color);
             let bg_brush = CreateSolidBrush(bg_color);
-            FillRect(hdc, &inner_rect, bg_brush);
+
+            let old_pen = SelectObject(hdc, border_pen as _);
+            let old_brush = SelectObject(hdc, bg_brush as _);
+
+            let radius = 12;
+
+            // Draw a rounded rectangle using native GDI shape rendering
+            // Top coordinate extends up to -radius so top corners remain square while bottom corners curve
+            RoundRect(
+                hdc,
+                rect.left,
+                rect.top - radius,
+                rect.right,
+                rect.bottom,
+                radius,
+                radius,
+            );
+
+            // Cleanup GDI objects
+            SelectObject(hdc, old_pen);
+            SelectObject(hdc, old_brush);
+            DeleteObject(border_pen as _);
             DeleteObject(bg_brush as _);
 
-            // 3. Text
+            // Draw Name Text
             SetBkMode(hdc, TRANSPARENT as i32);
             SetTextColor(hdc, fg_color);
 
             let font = CreateFontW(
-                -15, 0, 0, 0, FW_BOLD as i32, 0, 0, 0,
+                -14, 0, 0, 0, FW_BOLD as i32, 0, 0, 0,
                 DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32,
                 CLIP_DEFAULT_PRECIS as u32, DEFAULT_QUALITY as u32,
                 (DEFAULT_PITCH | FF_DONTCARE) as u32, w!("Segoe UI")
@@ -213,7 +222,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
         WM_NCDESTROY => {
-            // Cleanup heap memory allocation
             let _ = Box::from_raw(state_ptr);
             PostQuitMessage(0);
             0
