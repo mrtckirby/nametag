@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"] // Prevents a console window from popping up
+#![windows_subsystem = "windows"] // Prevents console window
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
@@ -10,31 +10,31 @@ use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetCapture;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-// Global state for horizontal dragging
-static mut DRAG_OFFSET_X: i32 = 0;
-static mut IS_DRAGGING: bool = false;
-static mut WINDOW_WIDTH: i32 = 0;
-static mut DARK_MODE: bool = true;
-static mut DISPLAY_NAME: Vec<u16> = Vec::new();
+// App state structure tied cleanly to the window instance
+struct AppState {
+    display_name: Vec<u16>,
+    dark_mode: bool,
+    window_width: i32,
+    drag_offset_x: i32,
+    is_dragging: bool,
+}
 
 fn main() {
     unsafe {
-        // 1. Fetch Windows User Name
         let name_str = get_windows_user_name();
-        DISPLAY_NAME = name_str.encode_utf16().chain(std::iter::once(0)).collect();
+        let display_name: Vec<u16> = name_str.encode_utf16().chain(std::iter::once(0)).collect();
+        let dark_mode = is_windows_dark_theme();
 
-        // 2. Detect Windows Dark/Light Theme
-        DARK_MODE = is_windows_dark_theme();
-
-        let instance = GetModuleHandleW(PCWSTR::null());
+        let instance = GetModuleHandleW(std::ptr::null());
         let class_name = w!("NameBannerClass");
 
         let wnd_class = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wnd_proc),
             hInstance: instance,
-            hCursor: LoadCursorW(0 as _, IDC_ARROW), // Standard arrow cursor
+            hCursor: LoadCursorW(0 as _, IDC_ARROW),
             hbrBackground: 0 as _,
+            lpszMenuName: std::ptr::null(),
             lpszClassName: class_name,
             cbClsExtra: 0,
             cbWndExtra: 0,
@@ -43,42 +43,52 @@ fn main() {
 
         RegisterClassW(&wnd_class);
 
-        // Calculate text width to auto-size window
-        let hdc = CreateDCW(w!("DISPLAY"), PCWSTR::null(), PCWSTR::null(), std::ptr::null());
+        // Measure text width
+        let hdc = CreateDCW(w!("DISPLAY"), std::ptr::null(), std::ptr::null(), std::ptr::null());
         let font = CreateFontW(
             -15, 0, 0, 0, FW_BOLD as i32, 0, 0, 0,
             DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32,
             CLIP_DEFAULT_PRECIS as u32, DEFAULT_QUALITY as u32,
-            DEFAULT_PITCH | FF_DONTCARE, w!("Segoe UI")
+            (DEFAULT_PITCH | FF_DONTCARE) as u32, w!("Segoe UI")
         );
         let old_font = SelectObject(hdc, font as _);
 
         let mut text_size = SIZE { cx: 0, cy: 0 };
-        GetTextExtentPoint32W(hdc, DISPLAY_NAME.as_ptr(), (DISPLAY_NAME.len() - 1) as i32, &mut text_size);
+        GetTextExtentPoint32W(hdc, display_name.as_ptr(), (display_name.len() - 1) as i32, &mut text_size);
         
         SelectObject(hdc, old_font);
         DeleteDC(hdc);
 
         let padding_x = 24;
         let padding_y = 6;
-        WINDOW_WIDTH = text_size.cx + padding_x;
+        let window_width = text_size.cx + padding_x;
         let window_height = text_size.cy + padding_y;
 
         let screen_width = GetSystemMetrics(SM_CXSCREEN);
-        let initial_x = (screen_width / 2) - (WINDOW_WIDTH / 2);
+        let initial_x = (screen_width / 2) - (window_width / 2);
 
-        // WS_POPUP removes title bar, WS_EX_TOPMOST pins it above all windows
+        // Package application state
+        let state = Box::new(AppState {
+            display_name,
+            dark_mode,
+            window_width,
+            drag_offset_x: 0,
+            is_dragging: false,
+        });
+        let state_ptr = Box::into_raw(state);
+
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             class_name,
             w!(""),
             WS_POPUP | WS_VISIBLE,
-            initial_x, 0, WINDOW_WIDTH, window_height,
-            0 as _, 0 as _, instance, std::ptr::null()
+            initial_x, 0, window_width, window_height,
+            0 as _, 0 as _, instance,
+            state_ptr as *const _ as *const std::ffi::c_void,
         );
 
-        // Apply rounded bottom corners (radius: 12)
-        let rgn = CreateRoundRectRgn(0, -12, WINDOW_WIDTH + 1, window_height + 1, 12, 12);
+        // Apply rounded bottom corners
+        let rgn = CreateRoundRectRgn(0, -12, window_width + 1, window_height + 1, 12, 12);
         SetWindowRgn(hwnd, rgn, 1);
 
         // Message Loop
@@ -98,6 +108,19 @@ fn main() {
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_NCCREATE {
+        let cs = lparam as *const CREATESTRUCTW;
+        let state_ptr = (*cs).lpCreateParams as *mut AppState;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+
+    let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState;
+    if state_ptr.is_null() {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    let state = &mut *state_ptr;
+
     match msg {
         WM_PAINT => {
             let mut ps = PAINTSTRUCT {
@@ -110,21 +133,21 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             };
             let hdc = BeginPaint(hwnd, &mut ps);
 
-            let (bg_color, fg_color, border_color) = if DARK_MODE {
-                (0x001F1F1F, 0x00FFFFFF, 0x00888888) // Dark theme (BGR format)
+            let (bg_color, fg_color, border_color) = if state.dark_mode {
+                (0x001F1F1F, 0x00FFFFFF, 0x00888888)
             } else {
-                (0x00F3F3F3, 0x00000000, 0x00555555) // Light theme (BGR format)
+                (0x00F3F3F3, 0x00000000, 0x00555555)
             };
 
             let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
             GetClientRect(hwnd, &mut rect);
 
-            // 1. Draw Contrasting Border Frame
+            // 1. Draw Border Frame
             let border_brush = CreateSolidBrush(border_color);
             FillRect(hdc, &rect, border_brush);
             DeleteObject(border_brush as _);
 
-            // 2. Inner Content Background
+            // 2. Background Fill
             let inner_rect = RECT {
                 left: 1,
                 top: 1,
@@ -135,7 +158,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             FillRect(hdc, &inner_rect, bg_brush);
             DeleteObject(bg_brush as _);
 
-            // 3. Draw Name Text
+            // 3. Text
             SetBkMode(hdc, TRANSPARENT as i32);
             SetTextColor(hdc, fg_color);
 
@@ -143,14 +166,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 -15, 0, 0, 0, FW_BOLD as i32, 0, 0, 0,
                 DEFAULT_CHARSET as u32, OUT_DEFAULT_PRECIS as u32,
                 CLIP_DEFAULT_PRECIS as u32, DEFAULT_QUALITY as u32,
-                DEFAULT_PITCH | FF_DONTCARE, w!("Segoe UI")
+                (DEFAULT_PITCH | FF_DONTCARE) as u32, w!("Segoe UI")
             );
             let old_font = SelectObject(hdc, font as _);
 
             DrawTextW(
                 hdc,
-                DISPLAY_NAME.as_ptr(),
-                (DISPLAY_NAME.len() - 1) as i32,
+                state.display_name.as_ptr(),
+                (state.display_name.len() - 1) as i32,
                 &rect as *const _ as *mut _,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE,
             );
@@ -162,36 +185,36 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
         WM_LBUTTONDOWN => {
-            IS_DRAGGING = true;
+            state.is_dragging = true;
             SetCapture(hwnd);
             let x = (lparam & 0xFFFF) as i16 as i32;
-            DRAG_OFFSET_X = x;
+            state.drag_offset_x = x;
             0
         }
         WM_MOUSEMOVE => {
-            if IS_DRAGGING {
+            if state.is_dragging {
                 let mut pt = POINT { x: 0, y: 0 };
                 GetCursorPos(&mut pt);
 
-                let mut new_x = pt.x - DRAG_OFFSET_X;
+                let mut new_x = pt.x - state.drag_offset_x;
                 let screen_width = GetSystemMetrics(SM_CXSCREEN);
-                let max_x = screen_width - WINDOW_WIDTH;
+                let max_x = screen_width - state.window_width;
 
-                // Clamp within screen horizontal bounds
                 if new_x < 0 { new_x = 0; }
                 if new_x > max_x { new_x = max_x; }
 
-                // Lock to top edge y = 0
                 SetWindowPos(hwnd, 0 as _, new_x, 0, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
             }
             0
         }
         WM_LBUTTONUP => {
-            IS_DRAGGING = false;
+            state.is_dragging = false;
             windows_sys::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
             0
         }
-        WM_DESTROY => {
+        WM_NCDESTROY => {
+            // Cleanup heap memory allocation
+            let _ = Box::from_raw(state_ptr);
             PostQuitMessage(0);
             0
         }
@@ -219,7 +242,6 @@ unsafe fn get_windows_user_name() -> String {
     let mut len: u32 = 257;
     let mut buf = vec![0u16; len as usize];
     
-    // GetUserNameW (advapi32)
     if windows_sys::Win32::System::WindowsProgramming::GetUserNameW(buf.as_mut_ptr(), &mut len) != 0 {
         return OsString::from_wide(&buf[..(len as usize - 1)]).to_string_lossy().into_owned();
     }
